@@ -57,6 +57,34 @@ linux/amd64`).
    install.sh (detect arch, pull the `.zip` from Releases, add to PATH).
 4. **Homebrew / Scoop** — TODO (tap + cask pointing at the Release archives).
 
+## Vendored tree-sitter grammars
+
+Most language grammars come from the `tree-sitter-wasms` npm package. A few
+(Pascal, Scala, Lua, Luau, Fortran) are vendored in `src/extraction/wasm/`
+because `tree-sitter-wasms` doesn't ship them, ships an ABI-incompatible build,
+or hasn't picked up a needed upstream fix. `grammars.ts` decides which path to
+take per language.
+
+To add or rebuild a vendored grammar, install the CLI as a devDependency and
+build against the grammar's source repo. Example for Fortran:
+
+```bash
+# from the codegraph repo root
+git clone --depth 1 https://github.com/stadelmanma/tree-sitter-fortran build-tsf
+node_modules/.bin/tree-sitter build --wasm \
+    -o src/extraction/wasm/tree-sitter-fortran.wasm \
+    build-tsf
+rm -rf build-tsf
+```
+
+`tree-sitter-cli` (devDependency) auto-downloads wasi-sdk on first use, so the
+host needs only Node + a network connection — no emscripten, no docker.
+
+After producing the `.wasm`, register the grammar in `grammars.ts` (file
+extensions in `EXTENSION_MAP`, file name in `WASM_GRAMMAR_FILES`, and the
+language in the vendored-fallback `if` branch), and add a per-language
+extractor in `src/extraction/languages/`.
+
 ## Release pipeline
 
 [`.github/workflows/release.yml`](.github/workflows/release.yml) — manually

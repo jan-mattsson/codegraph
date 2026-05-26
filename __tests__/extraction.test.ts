@@ -4323,3 +4323,177 @@ void helperFunction(int count) {
     expect(getSupportedLanguages()).toContain('objc');
   });
 });
+
+// =============================================================================
+// Fortran (modern free-form, .f90 / .f95 / .f03 / .f08 / .fi)
+// =============================================================================
+
+describe('Fortran Extraction', () => {
+  describe('Language detection', () => {
+    it('should detect Fortran files by every supported extension', () => {
+      expect(detectLanguage('src/physics_module.f90')).toBe('fortran');
+      expect(detectLanguage('legacy/calc.f95')).toBe('fortran');
+      expect(detectLanguage('newer/iface.f03')).toBe('fortran');
+      expect(detectLanguage('newest/x.f08')).toBe('fortran');
+      expect(detectLanguage('sys/syscom.fi')).toBe('fortran');
+    });
+
+    it('should report Fortran as supported', () => {
+      expect(isLanguageSupported('fortran')).toBe(true);
+      expect(getSupportedLanguages()).toContain('fortran');
+    });
+  });
+
+  describe('Module and submodule extraction', () => {
+    it('should extract MODULE / SUBMODULE / PROGRAM as module nodes', () => {
+      const code = `
+module dm_lists
+   implicit none
+contains
+   subroutine init()
+   end subroutine
+end module
+
+submodule (dm_lists) dm_lists_impl
+end submodule
+
+program main
+end program
+`;
+      const result = extractFromSource('m.f90', code);
+      const modules = result.nodes.filter((n) => n.kind === 'module').map((n) => n.name);
+      expect(modules).toContain('DM_LISTS'); // names are normalized to uppercase
+      expect(modules).toContain('DM_LISTS_IMPL');
+      expect(modules).toContain('MAIN');
+    });
+  });
+
+  describe('Subroutine and function extraction', () => {
+    it('should extract subroutines and functions with typed parameter nodes', () => {
+      const code = `
+subroutine init(n)
+   integer, intent(in) :: n
+end subroutine
+
+integer function sum_two(a, b)
+   integer, intent(in) :: a, b
+   sum_two = a + b
+end function
+`;
+      const result = extractFromSource('s.f90', code);
+      const funcs = result.nodes.filter((n) => n.kind === 'function');
+      expect(funcs.find((f) => f.name === 'INIT')).toBeDefined();
+      expect(funcs.find((f) => f.name === 'SUM_TWO')).toBeDefined();
+
+      // INIT has exactly one parameter, N : INTEGER.
+      const initParams = result.nodes.filter(
+        (n) => n.kind === 'parameter' && n.qualifiedName.startsWith('INIT::'),
+      );
+      expect(initParams.map((p) => p.name)).toEqual(['N']);
+      expect(initParams[0].signature).toBe('INTEGER');
+
+      // SUM_TWO has exactly two parameters, A and B, both INTEGER.
+      const sumTwoParams = result.nodes.filter(
+        (n) => n.kind === 'parameter' && n.qualifiedName.startsWith('SUM_TWO::'),
+      );
+      expect(sumTwoParams.map((p) => p.name).sort()).toEqual(['A', 'B']);
+      expect(sumTwoParams.every((p) => p.signature === 'INTEGER')).toBe(true);
+    });
+  });
+
+  describe('Derived types and inheritance', () => {
+    it('should extract TYPE as struct and EXTENDS as an extends reference', () => {
+      const code = `
+module shapes
+   implicit none
+   type, public :: Shape
+      integer :: id
+   end type
+   type, extends(Shape), public :: Circle
+      real :: radius
+   end type
+end module
+`;
+      const result = extractFromSource('shapes.f90', code);
+      const structs = result.nodes.filter((n) => n.kind === 'struct').map((n) => n.name);
+      expect(structs).toContain('SHAPE');
+      expect(structs).toContain('CIRCLE');
+
+      const extendsRef = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'extends' && r.referenceName === 'SHAPE'
+      );
+      expect(extendsRef).toBeDefined();
+    });
+  });
+
+  describe('Interface blocks', () => {
+    it('should extract a generic INTERFACE as an interface node', () => {
+      const code = `
+module ops
+   implicit none
+   interface solve
+      module procedure solve_int
+      module procedure solve_real
+   end interface
+end module
+`;
+      const result = extractFromSource('ops.f90', code);
+      const iface = result.nodes.find(
+        (n) => n.kind === 'interface' && n.name === 'SOLVE'
+      );
+      expect(iface).toBeDefined();
+    });
+  });
+
+  describe('USE statements', () => {
+    it('should record USE as an imports reference', () => {
+      const code = `
+subroutine consumer()
+   use my_module, only: helper
+   use, intrinsic :: iso_c_binding
+end subroutine
+`;
+      const result = extractFromSource('c.f90', code);
+      const useRefs = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'imports')
+        .map((r) => r.referenceName);
+      expect(useRefs).toContain('MY_MODULE');
+      expect(useRefs).toContain('ISO_C_BINDING');
+    });
+  });
+
+  describe('Call extraction', () => {
+    it('should record CALL statements and function calls as calls references', () => {
+      const code = `
+subroutine driver(x)
+   integer :: x
+   call helper(x)
+   x = compute(x)
+end subroutine
+`;
+      const result = extractFromSource('d.f90', code);
+      const calls = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(calls).toContain('HELPER');
+      expect(calls).toContain('COMPUTE');
+    });
+
+    it('should case-fold caller and callee so mixed-case matches uppercase', () => {
+      // Fortran is case-insensitive: `Call Foo` ≡ `CALL FOO`. The extractor
+      // normalises all names to uppercase so the resolver can match across
+      // declaration-vs-call casing.
+      const code = `
+subroutine Driver()
+   Call Foo()
+   call FOO()
+end subroutine
+`;
+      const result = extractFromSource('m.f90', code);
+      const fooCalls = result.unresolvedReferences.filter(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'FOO'
+      );
+      expect(fooCalls.length).toBe(2);
+    });
+  });
+});

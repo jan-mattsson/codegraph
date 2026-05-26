@@ -109,7 +109,13 @@ mkdir -p "$OUT"
 if [ "$OSFAM" = "win32" ]; then
   ARCHIVE="$OUT/codegraph-${TARGET}.zip"
   rm -f "$ARCHIVE"
-  ( cd "$WORK" && zip -rqX "$ARCHIVE" "codegraph-${TARGET}" )
+  if command -v zip >/dev/null 2>&1; then
+    ( cd "$WORK" && zip -rqX "$ARCHIVE" "codegraph-${TARGET}" )
+  else
+    # Fallback for Git-Bash-on-Windows hosts that don't ship `zip`.
+    powershell.exe -NoProfile -Command \
+      "Compress-Archive -Path '$(cygpath -w "$WORK/codegraph-${TARGET}")' -DestinationPath '$(cygpath -w "$ARCHIVE")' -Force"
+  fi
 else
   ARCHIVE="$OUT/codegraph-${TARGET}.tar.gz"
   # --no-xattrs: don't embed macOS xattrs that make GNU tar warn on Linux.
