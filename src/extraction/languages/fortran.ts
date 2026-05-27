@@ -96,26 +96,31 @@ function buildModuleFrame(moduleNode: SyntaxNode, src: string): ModuleFrame {
   return frame;
 }
 
-// Names declared on the LHS of a `variable_declaration`. Direct `identifier`
-// children are simple names (`INTEGER :: A, B`); `sized_declarator` and
-// `init_declarator` wrap a name plus a size/initialiser (`INTEGER :: A(N)`),
-// in which case the first identifier child is the variable name. We
-// deliberately ignore identifiers nested deeper (e.g. `N` inside `A(N)`)
-// because those are references, not declarations.
+// Recursively unwrap `init_declarator` / `sized_declarator` to find the
+// declared identifier. The variable name is always the FIRST named child at
+// each level, so we walk down child(0) until we hit an `identifier`. Handles:
+//   identifier                                      → A
+//   sized_declarator { identifier, size }           → A(N)
+//   init_declarator  { identifier, value }          → A = 1
+//   init_declarator  { sized_declarator{ id, sz }, value }  → A(N) = [..]
+function declaratorName(c: SyntaxNode | null): SyntaxNode | null {
+  if (!c) return null;
+  if (c.type === 'identifier') return c;
+  if (c.type === 'sized_declarator' || c.type === 'init_declarator') {
+    return declaratorName(c.namedChild(0));
+  }
+  return null;
+}
+
+// Names declared on the LHS of a `variable_declaration`. Walks each top-level
+// declarator (`A`, `A(N)`, `A = 1`, or `A(N) = [..]`) and pulls out the
+// identifier name. Identifiers nested in a `size` expression (e.g. `N` inside
+// `A(N)`) are references and intentionally skipped.
 function declaredNames(decl: SyntaxNode, src: string): string[] {
   const names: string[] = [];
   for (const c of decl.namedChildren) {
-    if (!c) continue;
-    if (c.type === 'identifier') {
-      names.push(norm(getNodeText(c, src)));
-    } else if (c.type === 'sized_declarator' || c.type === 'init_declarator') {
-      for (const cc of c.namedChildren) {
-        if (cc?.type === 'identifier') {
-          names.push(norm(getNodeText(cc, src)));
-          break;
-        }
-      }
-    }
+    const id = declaratorName(c);
+    if (id) names.push(norm(getNodeText(id, src)));
   }
   return names;
 }
@@ -185,23 +190,17 @@ function eachDeclaredEntry(
   const out: Array<{ name: string; node: SyntaxNode; value?: string }> = [];
   for (const c of decl.namedChildren) {
     if (!c) continue;
-    if (c.type === 'identifier') {
-      out.push({ name: norm(getNodeText(c, src)), node: c });
-    } else if (c.type === 'init_declarator') {
-      const id = c.namedChild(0);
-      if (!id || id.type !== 'identifier') continue;
-      // The init expression sits as the second named child; the leading
-      // identifier is the variable name.
+    const id = declaratorName(c);
+    if (!id) continue;
+    // Only `init_declarator` carries an initialiser. The init expression is
+    // always the second named child — the first slot is whatever declarator
+    // form the name is in (bare identifier, or sized_declarator wrapping it).
+    let value: string | undefined;
+    if (c.type === 'init_declarator') {
       const valueNode = c.namedChild(1);
-      out.push({
-        name: norm(getNodeText(id, src)),
-        node: id,
-        value: valueNode ? getNodeText(valueNode, src).trim() : undefined,
-      });
-    } else if (c.type === 'sized_declarator') {
-      const id = c.namedChildren.find((cc) => cc?.type === 'identifier');
-      if (id) out.push({ name: norm(getNodeText(id, src)), node: id });
+      if (valueNode) value = getNodeText(valueNode, src).trim();
     }
+    out.push({ name: norm(getNodeText(id, src)), node: id, value });
   }
   return out;
 }

@@ -4571,6 +4571,23 @@ end module
       expect(byName.HIDDEN.visibility).toBe('private');           // bare PRIVATE default
     });
 
+    it('should handle sized + initialised PARAMETER arrays like `TABLE(N) = [...]`', () => {
+      // Regression for public PARAMETER arrays where the declarator wraps a
+      // `sized_declarator` inside an `init_declarator`:
+      //   init_declarator { sized_declarator { identifier, size }, value }
+      const code = `
+module a
+   integer, parameter :: N = 3
+   integer, public, parameter :: TABLE(N) = [10, 20, 30]
+end module
+`;
+      const result = extractFromSource('a.f90', code);
+      const table = result.nodes.find((n) => n.kind === 'constant' && n.name === 'TABLE');
+      expect(table).toBeDefined();
+      expect(table?.signature).toMatch(/^INTEGER =/);
+      expect(table?.visibility).toBe('public');
+    });
+
     it('should not emit local variables inside routines as module-level symbols', () => {
       const code = `
 module m
