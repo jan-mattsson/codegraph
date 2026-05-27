@@ -60,20 +60,48 @@ type ModuleFrame = {
   defaultVisibility: 'public' | 'private';
   perSymbol: Map<string, 'public' | 'private'>;
 };
-const moduleFrames: ModuleFrame[] = [];
 
-// Parallel stack of "what kind of scope am I in?" — needed because emission
-// of fields / module constants / module variables all flow through the
-// `variable_declaration` AST node, and we have to look at the enclosing scope
-// to know which one to emit (or to skip the declaration entirely if it's a
-// local var inside a routine body).
-const scopeKinds: NodeKind[] = [];
-function currentScopeKind(): NodeKind | undefined {
-  return scopeKinds[scopeKinds.length - 1];
+// Per-extraction state: a stack of module visibility frames + a parallel stack
+// of "what kind of scope am I in?" (used because emission of fields / module
+// constants / module variables all flow through `variable_declaration` and
+// the dispatch depends on the enclosing scope).
+//
+// Keyed on `ctx.nodes` (the running array of extracted nodes), because:
+//   * the core extractor creates a fresh ExtractorContext object on every
+//     `visitNode` invocation, so the ctx itself is not a stable per-extraction
+//     identity;
+//   * `ctx.nodes` is a getter that returns the underlying TreeSitterExtractor's
+//     `nodes` array — the SAME reference across every ctx the extractor builds
+//     during one parse, and a different one for any concurrent extraction.
+//
+// Result: two parses running in parallel in the same JS context each see their
+// own frames, and a single parse sees consistent state across all the throwaway
+// ctx objects it receives. The WeakMap lets the state get garbage-collected
+// alongside the extractor when the parse ends.
+type FortranState = {
+  moduleFrames: ModuleFrame[];
+  scopeKinds: NodeKind[];
+};
+const stateByExtraction = new WeakMap<object, FortranState>();
+function getState(ctx: ExtractorContext): FortranState {
+  const key = ctx.nodes as unknown as object;
+  let state = stateByExtraction.get(key);
+  if (!state) {
+    state = { moduleFrames: [], scopeKinds: [] };
+    stateByExtraction.set(key, state);
+  }
+  return state;
 }
 
-function currentModuleVisibility(name: string): 'public' | 'private' | undefined {
-  const frame = moduleFrames[moduleFrames.length - 1];
+function currentScopeKind(state: FortranState): NodeKind | undefined {
+  return state.scopeKinds[state.scopeKinds.length - 1];
+}
+
+function currentModuleVisibility(
+  state: FortranState,
+  name: string,
+): 'public' | 'private' | undefined {
+  const frame = state.moduleFrames[state.moduleFrames.length - 1];
   if (!frame) return undefined;
   return frame.perSymbol.get(name) ?? frame.defaultVisibility;
 }
@@ -246,13 +274,14 @@ export const fortranExtractor: LanguageExtractor = {
 
   visitNode: (node: SyntaxNode, ctx: ExtractorContext): boolean => {
     const src = ctx.source;
+    const state = getState(ctx);
 
     switch (node.type) {
       case 'translation_unit': {
         // Clear per-file state at every file boundary so a crash mid-walk
         // on a previous file can't leak state into the next one.
-        moduleFrames.length = 0;
-        scopeKinds.length = 0;
+        state.moduleFrames.length = 0;
+        state.scopeKinds.length = 0;
         return false; // let the default walker descend into children
       }
 
@@ -266,17 +295,17 @@ export const fortranExtractor: LanguageExtractor = {
         // visibility from the parent module's interface section, which we
         // don't try to resolve here.
         const frame = node.type === 'module' ? buildModuleFrame(node, src) : null;
-        if (frame) moduleFrames.push(frame);
+        if (frame) state.moduleFrames.push(frame);
         if (created) {
           ctx.pushScope(created.id);
-          scopeKinds.push('module');
+          state.scopeKinds.push('module');
         }
         visitBody(node, headerType, ctx);
         if (created) {
-          scopeKinds.pop();
+          state.scopeKinds.pop();
           ctx.popScope();
         }
-        if (frame) moduleFrames.pop();
+        if (frame) state.moduleFrames.pop();
         return true;
       }
 
@@ -286,11 +315,11 @@ export const fortranExtractor: LanguageExtractor = {
         const created = ctx.createNode('module', name, node);
         if (created) {
           ctx.pushScope(created.id);
-          scopeKinds.push('module');
+          state.scopeKinds.push('module');
         }
         visitBody(node, 'program_statement', ctx);
         if (created) {
-          scopeKinds.pop();
+          state.scopeKinds.pop();
           ctx.popScope();
         }
         return true;
@@ -320,14 +349,14 @@ export const fortranExtractor: LanguageExtractor = {
         //   nested in program / parent routine's CONTAINS → `private` to the enclosing unit
         // The file scope is always at the bottom of nodeStack, so length === 1
         // means "no Fortran scope above me".
-        let visibility = currentModuleVisibility(name);
+        let visibility = currentModuleVisibility(state, name);
         if (visibility === undefined) {
           visibility = ctx.nodeStack.length <= 1 ? 'public' : 'private';
         }
         const created = ctx.createNode('function', name, node, { signature, visibility });
         if (created) {
           ctx.pushScope(created.id);
-          scopeKinds.push('function');
+          state.scopeKinds.push('function');
           // Emit a `parameter` node per declared argument, with the declared
           // type ("INTEGER", "REAL", "TYPE(FOO)", …) in `signature`. The type
           // comes from a `variable_declaration` in the routine's body, since
@@ -342,7 +371,7 @@ export const fortranExtractor: LanguageExtractor = {
             }
           }
           visitBody(node, headerType, ctx);
-          scopeKinds.pop();
+          state.scopeKinds.pop();
           ctx.popScope();
         }
         return true;
@@ -361,7 +390,7 @@ export const fortranExtractor: LanguageExtractor = {
             if (text === 'public' || text === 'private') visibility = text;
           }
         }
-        if (!visibility) visibility = currentModuleVisibility(name);
+        if (!visibility) visibility = currentModuleVisibility(state, name);
         const created = ctx.createNode('struct', name || '<anonymous>', node, { visibility });
         // Capture `EXTENDS(Parent)` as an `extends` reference.
         if (created && stmt) {
@@ -373,11 +402,11 @@ export const fortranExtractor: LanguageExtractor = {
         }
         if (created) {
           ctx.pushScope(created.id);
-          scopeKinds.push('struct');
+          state.scopeKinds.push('struct');
         }
         visitBody(node, 'derived_type_statement', ctx);
         if (created) {
-          scopeKinds.pop();
+          state.scopeKinds.pop();
           ctx.popScope();
         }
         return true;
@@ -390,15 +419,15 @@ export const fortranExtractor: LanguageExtractor = {
         // anyway so the procedures inside still belong to *something*.
         const ifaceName = statementName(stmt, src);
         const name = ifaceName || '<anonymous-interface>';
-        const visibility = ifaceName ? currentModuleVisibility(ifaceName) : undefined;
+        const visibility = ifaceName ? currentModuleVisibility(state, ifaceName) : undefined;
         const created = ctx.createNode('interface', name, node, { visibility });
         if (created) {
           ctx.pushScope(created.id);
-          scopeKinds.push('interface');
+          state.scopeKinds.push('interface');
         }
         visitBody(node, 'interface_statement', ctx);
         if (created) {
-          scopeKinds.pop();
+          state.scopeKinds.pop();
           ctx.popScope();
         }
         return true;
@@ -448,21 +477,26 @@ export const fortranExtractor: LanguageExtractor = {
 
         // Sibling qualifiedName: pop the host function scope so createNode
         // resolves the entry's parent as the module (or file), not the host.
-        const popped = currentScopeKind() === 'function';
-        let restoredScope: string | undefined;
+        // Use try/finally so the host scope is restored even if createNode
+        // throws — leaking the popped frame would corrupt every subsequent
+        // emission in this file.
+        const popped = currentScopeKind(state) === 'function';
+        const hostScopeId = popped ? ctx.nodeStack[ctx.nodeStack.length - 1] : undefined;
         if (popped) {
-          restoredScope = ctx.nodeStack[ctx.nodeStack.length - 1];
           ctx.popScope();
-          scopeKinds.pop();
+          state.scopeKinds.pop();
         }
-        let visibility = currentModuleVisibility(entryName);
-        if (visibility === undefined) {
-          visibility = ctx.nodeStack.length <= 1 ? 'public' : 'private';
-        }
-        ctx.createNode('function', entryName, node, { signature, visibility });
-        if (popped && restoredScope) {
-          ctx.pushScope(restoredScope);
-          scopeKinds.push('function');
+        try {
+          let visibility = currentModuleVisibility(state, entryName);
+          if (visibility === undefined) {
+            visibility = ctx.nodeStack.length <= 1 ? 'public' : 'private';
+          }
+          ctx.createNode('function', entryName, node, { signature, visibility });
+        } finally {
+          if (popped && hostScopeId !== undefined) {
+            ctx.pushScope(hostScopeId);
+            state.scopeKinds.push('function');
+          }
         }
         return true;
       }
@@ -472,7 +506,7 @@ export const fortranExtractor: LanguageExtractor = {
         // of a module or the field list of a derived type. Inside a routine
         // body these are local variables / parameter type specs and we don't
         // surface them as graph nodes.
-        const scope = currentScopeKind();
+        const scope = currentScopeKind(state);
         if (scope !== 'module' && scope !== 'struct') return true;
 
         const typeNode = node.namedChildren.find(
@@ -497,7 +531,7 @@ export const fortranExtractor: LanguageExtractor = {
           // qualifier overrides.
           const visibility =
             inlineVisibility ??
-            (scope === 'module' ? currentModuleVisibility(entry.name) : 'public');
+            (scope === 'module' ? currentModuleVisibility(state, entry.name) : 'public');
           // Pack the value into the signature for PARAMETER constants — the
           // value is part of what defines the constant.
           const signature =
