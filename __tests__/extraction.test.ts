@@ -4602,6 +4602,67 @@ end module
     });
   });
 
+  describe('ENTRY statements', () => {
+    it('should emit each ENTRY as a sibling of the host routine, with inherited return type and own visibility', () => {
+      const code = `
+module m
+   private
+   public :: HOST_PUB, ENTRY_PUB
+contains
+   subroutine HOST_PUB()
+      entry ENTRY_PUB(x)
+      integer :: x
+      entry ENTRY_PRIV(y)
+      integer :: y
+   end subroutine
+
+   integer function FHOST(a)
+      integer :: a
+      FHOST = a
+      entry FALT(b)
+      integer :: b
+      FALT = b
+   end function
+end module
+`;
+      const result = extractFromSource('m.f90', code);
+      const fn = (n: string) =>
+        result.nodes.find((x) => x.kind === 'function' && x.name === n);
+
+      // QualifiedNames sit at the SAME LEVEL as the host (sibling under M::),
+      // not nested inside the host's scope. That matches how `CALL ENTRY_PUB`
+      // is resolved at link time.
+      expect(fn('HOST_PUB')?.qualifiedName).toBe('M::HOST_PUB');
+      expect(fn('ENTRY_PUB')?.qualifiedName).toBe('M::ENTRY_PUB');
+      expect(fn('ENTRY_PRIV')?.qualifiedName).toBe('M::ENTRY_PRIV');
+      expect(fn('FALT')?.qualifiedName).toBe('M::FALT');
+
+      // Visibility flows through the module frame, independent of host.
+      expect(fn('ENTRY_PUB')?.visibility).toBe('public');   // listed in PUBLIC ::
+      expect(fn('ENTRY_PRIV')?.visibility).toBe('private'); // bare PRIVATE default
+
+      // A subroutine entry has no return type; a function entry inherits the
+      // host's prefix type when not declared explicitly for itself.
+      expect(fn('ENTRY_PUB')?.signature).not.toContain('->');
+      expect(fn('FALT')?.signature).toMatch(/-> INTEGER$/);
+    });
+
+    it('should treat top-level external routines and their entries as public', () => {
+      const code = `
+subroutine standalone()
+   entry alt_entry(x)
+   integer :: x
+end subroutine
+`;
+      const result = extractFromSource('s.f90', code);
+      const fn = (n: string) =>
+        result.nodes.find((x) => x.kind === 'function' && x.name === n);
+      expect(fn('STANDALONE')?.visibility).toBe('public');
+      expect(fn('ALT_ENTRY')?.visibility).toBe('public');
+      expect(fn('ALT_ENTRY')?.qualifiedName).toBe('ALT_ENTRY'); // no enclosing scope
+    });
+  });
+
   describe('Visibility', () => {
     it('should resolve subroutine/function visibility from module access statements', () => {
       const code = `

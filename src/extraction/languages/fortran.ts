@@ -404,6 +404,69 @@ export const fortranExtractor: LanguageExtractor = {
         return true;
       }
 
+      case 'entry_statement': {
+        // ENTRY adds another callable name to the enclosing routine —
+        // legacy F77 mechanism but still common in long-lived Fortran
+        // codebases. Each entry is its own externally-callable symbol, so
+        // we emit it as a sibling `function` node at the host's parent
+        // qualifiedName level: `MODULE::HOST` and `MODULE::ALT_ENTRY` are
+        // peers, matching how Fortran resolves `CALL ALT_ENTRY` at link
+        // time. We don't try to attribute calls inside the shared body to
+        // the right entry — entries usually disappear in any modernisation
+        // refactor, and the caller graph is the load-bearing piece for
+        // that work.
+        const entryName = statementName(node, src);
+        if (!entryName) return true;
+
+        // The host's prefix type / RESULT clause feeds the entry's return
+        // type only if the entry has neither of its own.
+        let host: SyntaxNode | null = node.parent;
+        while (host && host.type !== 'subroutine' && host.type !== 'function') {
+          host = host.parent;
+        }
+
+        const params = node.childForFieldName('parameters');
+        const paramsText = params ? getNodeText(params, src) : '';
+        let signature: string | undefined;
+        if (host?.type === 'function') {
+          // For function entries: prefix-type on entry_statement / RESULT /
+          // body declaration of the entry name, in that order. As a final
+          // fallback an entry inherits the host's prefix type.
+          let returnType = functionReturnType(node, host, entryName, src);
+          if (!returnType) {
+            const hostStmt = findChild(host, 'function_statement');
+            const prefix = hostStmt?.namedChildren.find(
+              (c) => c?.type === 'intrinsic_type' || c?.type === 'derived_type',
+            );
+            if (prefix) returnType = norm(getNodeText(prefix, src));
+          }
+          const head = paramsText || '()';
+          signature = returnType ? `${head} -> ${returnType}` : head;
+        } else {
+          signature = paramsText || undefined;
+        }
+
+        // Sibling qualifiedName: pop the host function scope so createNode
+        // resolves the entry's parent as the module (or file), not the host.
+        const popped = currentScopeKind() === 'function';
+        let restoredScope: string | undefined;
+        if (popped) {
+          restoredScope = ctx.nodeStack[ctx.nodeStack.length - 1];
+          ctx.popScope();
+          scopeKinds.pop();
+        }
+        let visibility = currentModuleVisibility(entryName);
+        if (visibility === undefined) {
+          visibility = ctx.nodeStack.length <= 1 ? 'public' : 'private';
+        }
+        ctx.createNode('function', entryName, node, { signature, visibility });
+        if (popped && restoredScope) {
+          ctx.pushScope(restoredScope);
+          scopeKinds.push('function');
+        }
+        return true;
+      }
+
       case 'variable_declaration': {
         // Only emit symbols when the declaration is the public/private surface
         // of a module or the field list of a derived type. Inside a routine
