@@ -4815,6 +4815,29 @@ end program
     });
   });
 
+  describe('INCLUDE statements', () => {
+    it('should emit an imports reference for both #include and native INCLUDE forms, keyed on basename', () => {
+      // `#include "foo.fi"` is the cpp-style preprocessor form; `INCLUDE 'foo.fi'`
+      // is the native Fortran form. Both should produce an `imports` reference
+      // to the included file's basename so a consumer→included-file edge can
+      // be wired up by the resolver (matching file nodes by basename).
+      const code = `
+subroutine consumer()
+#include "shared/defs.fi"
+   INCLUDE 'params.fi'
+end subroutine
+`;
+      const result = extractFromSource('c.f90', code);
+      const includeRefs = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'imports')
+        .map((r) => r.referenceName);
+      // The cpp-style path strips the leading directory; bare basename is
+      // what matches file nodes.
+      expect(includeRefs).toContain('defs.fi');
+      expect(includeRefs).toContain('params.fi');
+    });
+  });
+
   describe('Call extraction', () => {
     it('should record CALL statements and function calls as calls references', () => {
       const code = `

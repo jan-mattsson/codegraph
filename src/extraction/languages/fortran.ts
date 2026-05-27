@@ -585,6 +585,43 @@ export const fortranExtractor: LanguageExtractor = {
         return true; // a USE has no callable body
       }
 
+      case 'preproc_include':
+      case 'include_statement': {
+        // Both forms reference another file by name. Emit an `imports` edge
+        // so consumer → included-file relationships are queryable ("which
+        // files include this header?") and so the resolver can reach symbols
+        // declared in the include from any consumer.
+        //
+        // Reference name is the bare basename — file nodes are keyed by
+        // basename via path.basename(filePath), so exact-name matching binds
+        // the edge to the right file. We deliberately don't case-fold this:
+        // file node names preserve filesystem casing, and Fortran convention
+        // is to write the include path as it appears on disk.
+        let raw: string | undefined;
+        if (node.type === 'preproc_include') {
+          // #include "foo.fi" — string_literal child wraps the path. Tree-
+          // sitter exposes the inner content as a `string_content` child;
+          // fall back to stripping quotes/brackets from the literal text
+          // for the angle-bracket form.
+          const lit = findChild(node, 'string_literal');
+          if (lit) {
+            const content = findChild(lit, 'string_content');
+            raw = content
+              ? getNodeText(content, src)
+              : getNodeText(lit, src).replace(/^[<"']|[>"']$/g, '');
+          }
+        } else {
+          // INCLUDE 'foo.fi' — `filename` is a named child of type `filename`
+          // (not a tree-sitter field), carrying the quoted form.
+          const filename = findChild(node, 'filename');
+          if (filename) raw = getNodeText(filename, src).replace(/^["']|["']$/g, '');
+        }
+        if (!raw) return true;
+        const basename = raw.split(/[\/\\]/).pop();
+        if (basename) addRef(node, basename, 'imports', ctx);
+        return true;
+      }
+
       case 'subroutine_call': {
         const callee = node.childForFieldName('subroutine');
         if (callee) addRef(callee, norm(getNodeText(callee, src)), 'calls', ctx);
