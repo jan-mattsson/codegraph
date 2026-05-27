@@ -4347,14 +4347,14 @@ describe('Fortran Extraction', () => {
   describe('Module and submodule extraction', () => {
     it('should extract MODULE / SUBMODULE / PROGRAM as module nodes', () => {
       const code = `
-module dm_lists
+module geometry
    implicit none
 contains
    subroutine init()
    end subroutine
 end module
 
-submodule (dm_lists) dm_lists_impl
+submodule (geometry) geometry_impl
 end submodule
 
 program main
@@ -4362,9 +4362,65 @@ end program
 `;
       const result = extractFromSource('m.f90', code);
       const modules = result.nodes.filter((n) => n.kind === 'module').map((n) => n.name);
-      expect(modules).toContain('DM_LISTS'); // names are normalized to uppercase
-      expect(modules).toContain('DM_LISTS_IMPL');
+      expect(modules).toContain('GEOMETRY'); // names are normalized to uppercase
+      expect(modules).toContain('GEOMETRY_IMPL');
       expect(modules).toContain('MAIN');
+    });
+
+    it('should nest routines defined inside a submodule under the submodule scope', () => {
+      const code = `
+module parent_mod
+end module
+
+submodule (parent_mod) child_mod
+contains
+   subroutine helper()
+   end subroutine
+end submodule
+`;
+      const result = extractFromSource('sm.f90', code);
+      const helper = result.nodes.find(
+        (n) => n.kind === 'function' && n.name === 'HELPER',
+      );
+      expect(helper).toBeDefined();
+      expect(helper?.qualifiedName).toBe('CHILD_MOD::HELPER');
+    });
+  });
+
+  describe('Type-bound procedures', () => {
+    it('should emit type-bound procedures as method nodes and capture renames as calls edges', () => {
+      const code = `
+module list_mod
+   type :: linked_list
+   contains
+      procedure :: append => list_append
+      procedure :: size_of
+   end type
+contains
+   subroutine list_append(self, x)
+      class(linked_list) :: self
+      integer :: x
+   end subroutine
+end module
+`;
+      const result = extractFromSource('list.f90', code);
+      const methods = result.nodes.filter((n) => n.kind === 'method');
+
+      // The renamed binding (`append => list_append`) lives under the type's
+      // scope and is named after the LHS, not the implementation.
+      const append = methods.find((m) => m.name === 'APPEND');
+      expect(append).toBeDefined();
+      expect(append?.qualifiedName).toBe('LIST_MOD::LINKED_LIST::APPEND');
+
+      // Bare-binding form (`procedure :: size_of`) — name and implementation are identical.
+      expect(methods.some((m) => m.name === 'SIZE_OF')).toBe(true);
+
+      // The rename produces a calls reference to the implementing routine,
+      // so callers of the method resolve to the underlying subroutine.
+      const callsToImpl = result.unresolvedReferences.filter(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'LIST_APPEND',
+      );
+      expect(callsToImpl.length).toBeGreaterThan(0);
     });
   });
 
@@ -4569,6 +4625,26 @@ end module
       // Module-default PRIVATE flips the implicit visibility.
       expect(byName.EXPOSED.visibility).toBe('public');           // inline PUBLIC wins
       expect(byName.HIDDEN.visibility).toBe('private');           // bare PRIVATE default
+    });
+
+    it('should emit each name of a multi-name PARAMETER as its own constant with its own value', () => {
+      // `INTEGER, PARAMETER :: A=1, B=2, C=3` packs three init_declarators
+      // into one variable_declaration. Each should yield a separate constant
+      // node carrying its own initialiser.
+      const code = `
+module multi
+   integer, parameter, public :: A = 1, B = 2, C = 3
+end module
+`;
+      const result = extractFromSource('multi.f90', code);
+      const constants = result.nodes
+        .filter((n) => n.kind === 'constant' && n.qualifiedName.startsWith('MULTI::'))
+        .sort((a, b) => a.name.localeCompare(b.name));
+      expect(constants.map((c) => c.name)).toEqual(['A', 'B', 'C']);
+      expect(constants[0].signature).toBe('INTEGER = 1');
+      expect(constants[1].signature).toBe('INTEGER = 2');
+      expect(constants[2].signature).toBe('INTEGER = 3');
+      expect(constants.every((c) => c.visibility === 'public')).toBe(true);
     });
 
     it('should handle sized + initialised PARAMETER arrays like `TABLE(N) = [...]`', () => {
