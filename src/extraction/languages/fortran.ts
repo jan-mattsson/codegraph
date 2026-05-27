@@ -1,6 +1,7 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getNodeText } from '../tree-sitter-helpers';
 import type { LanguageExtractor, ExtractorContext } from '../tree-sitter-types';
+import type { NodeKind } from '../../types';
 
 // Fortran is case-insensitive (`Call Foo` ≡ `call FOO`), so every name is
 // normalised to uppercase before being stored or referenced. That way callers
@@ -61,6 +62,16 @@ type ModuleFrame = {
 };
 const moduleFrames: ModuleFrame[] = [];
 
+// Parallel stack of "what kind of scope am I in?" — needed because emission
+// of fields / module constants / module variables all flow through the
+// `variable_declaration` AST node, and we have to look at the enclosing scope
+// to know which one to emit (or to skip the declaration entirely if it's a
+// local var inside a routine body).
+const scopeKinds: NodeKind[] = [];
+function currentScopeKind(): NodeKind | undefined {
+  return scopeKinds[scopeKinds.length - 1];
+}
+
 function currentModuleVisibility(name: string): 'public' | 'private' | undefined {
   const frame = moduleFrames[moduleFrames.length - 1];
   if (!frame) return undefined;
@@ -109,20 +120,90 @@ function declaredNames(decl: SyntaxNode, src: string): string[] {
   return names;
 }
 
-// For a given parameter name, return the declared type ("INTEGER", "REAL",
-// "TYPE(FOO)" …) by scanning the subroutine/function wrapper's
-// `variable_declaration` children. Returns undefined if the parameter has no
-// explicit declaration (e.g. implicit typing).
-function parameterType(wrapper: SyntaxNode, pname: string, src: string): string | undefined {
+// For a given variable name, return the declared type ("INTEGER", "REAL",
+// "TYPE(FOO)" …) by scanning a wrapper's `variable_declaration` children.
+// Used both for parameter types and for RESULT-clause return types — anywhere
+// where Fortran declares the name in a list separately from its type spec.
+function declaredTypeOf(wrapper: SyntaxNode, name: string, src: string): string | undefined {
   for (const c of wrapper.namedChildren) {
     if (!c || c.type !== 'variable_declaration') continue;
-    if (!declaredNames(c, src).includes(pname)) continue;
+    if (!declaredNames(c, src).includes(name)) continue;
     const typeNode = c.namedChildren.find(
       (n) => n?.type === 'intrinsic_type' || n?.type === 'derived_type',
     );
     if (typeNode) return norm(getNodeText(typeNode, src));
   }
   return undefined;
+}
+
+// Return type of a Fortran function. Three forms, in priority order:
+//   1. Prefix type:        `INTEGER FUNCTION foo(...)`         → intrinsic_type/derived_type sibling of `name` on function_statement
+//   2. RESULT clause:      `FUNCTION foo(...) RESULT(r)` + `INTEGER :: r` in body → declared type of `r`
+//   3. Implicit:           `FUNCTION foo(...)` with `INTEGER :: foo` in body → declared type of `foo` itself
+function functionReturnType(
+  stmt: SyntaxNode | null,
+  wrapper: SyntaxNode,
+  fname: string,
+  src: string,
+): string | undefined {
+  if (!stmt) return undefined;
+  // Form 1 — prefix type on the function_statement itself
+  for (const c of stmt.namedChildren) {
+    if (!c) continue;
+    if (c.type === 'intrinsic_type' || c.type === 'derived_type') {
+      return norm(getNodeText(c, src));
+    }
+  }
+  // Form 2 — RESULT clause names a different return variable
+  let resultName: string | undefined;
+  const resultClause = findChild(stmt, 'function_result');
+  if (resultClause) {
+    const id = findChild(resultClause, 'identifier');
+    if (id) resultName = norm(getNodeText(id, src));
+  }
+  // Form 3 — fall back to a body declaration of the function name itself
+  return declaredTypeOf(wrapper, resultName ?? fname, src);
+}
+
+// Collect the type qualifiers off a variable_declaration (lowercased, trimmed).
+// E.g. `INTEGER, PARAMETER, PUBLIC :: X` → ['parameter', 'public'].
+function typeQualifiers(decl: SyntaxNode, src: string): string[] {
+  const out: string[] = [];
+  for (const c of decl.namedChildren) {
+    if (c?.type === 'type_qualifier') out.push(getNodeText(c, src).trim().toLowerCase());
+  }
+  return out;
+}
+
+// Walk a variable_declaration and yield one record per declared name. Each
+// record carries the name, a position node, and (for `init_declarator`) the
+// initialiser text — used as the value of PARAMETER constants.
+function eachDeclaredEntry(
+  decl: SyntaxNode,
+  src: string,
+): Array<{ name: string; node: SyntaxNode; value?: string }> {
+  const out: Array<{ name: string; node: SyntaxNode; value?: string }> = [];
+  for (const c of decl.namedChildren) {
+    if (!c) continue;
+    if (c.type === 'identifier') {
+      out.push({ name: norm(getNodeText(c, src)), node: c });
+    } else if (c.type === 'init_declarator') {
+      const id = c.namedChild(0);
+      if (!id || id.type !== 'identifier') continue;
+      // The init expression sits as the second named child; the leading
+      // identifier is the variable name.
+      const valueNode = c.namedChild(1);
+      out.push({
+        name: norm(getNodeText(id, src)),
+        node: id,
+        value: valueNode ? getNodeText(valueNode, src).trim() : undefined,
+      });
+    } else if (c.type === 'sized_declarator') {
+      const id = c.namedChildren.find((cc) => cc?.type === 'identifier');
+      if (id) out.push({ name: norm(getNodeText(id, src)), node: id });
+    }
+  }
+  return out;
 }
 
 function addRef(
@@ -169,9 +250,10 @@ export const fortranExtractor: LanguageExtractor = {
 
     switch (node.type) {
       case 'translation_unit': {
-        // Clear the visibility stack at every file boundary so a crash mid-
-        // walk on a previous file can't leak state into the next one.
+        // Clear per-file state at every file boundary so a crash mid-walk
+        // on a previous file can't leak state into the next one.
         moduleFrames.length = 0;
+        scopeKinds.length = 0;
         return false; // let the default walker descend into children
       }
 
@@ -186,9 +268,15 @@ export const fortranExtractor: LanguageExtractor = {
         // don't try to resolve here.
         const frame = node.type === 'module' ? buildModuleFrame(node, src) : null;
         if (frame) moduleFrames.push(frame);
-        if (created) ctx.pushScope(created.id);
+        if (created) {
+          ctx.pushScope(created.id);
+          scopeKinds.push('module');
+        }
         visitBody(node, headerType, ctx);
-        if (created) ctx.popScope();
+        if (created) {
+          scopeKinds.pop();
+          ctx.popScope();
+        }
         if (frame) moduleFrames.pop();
         return true;
       }
@@ -197,9 +285,15 @@ export const fortranExtractor: LanguageExtractor = {
         const stmt = findChild(node, 'program_statement');
         const name = statementName(stmt, src) || 'MAIN';
         const created = ctx.createNode('module', name, node);
-        if (created) ctx.pushScope(created.id);
+        if (created) {
+          ctx.pushScope(created.id);
+          scopeKinds.push('module');
+        }
         visitBody(node, 'program_statement', ctx);
-        if (created) ctx.popScope();
+        if (created) {
+          scopeKinds.pop();
+          ctx.popScope();
+        }
         return true;
       }
 
@@ -210,7 +304,17 @@ export const fortranExtractor: LanguageExtractor = {
         const name = statementName(stmt, src);
         if (!name) return true; // malformed — skip but don't recurse
         const params = stmt ? stmt.childForFieldName('parameters') : null;
-        const signature = params ? getNodeText(params, src) : undefined;
+        const paramsText = params ? getNodeText(params, src) : '';
+        // Return type only applies to functions. Compose `(params) -> TYPE` so
+        // the signature carries the full call-site shape at a glance.
+        let signature: string | undefined;
+        if (node.type === 'function') {
+          const returnType = functionReturnType(stmt, node, name, src);
+          const head = paramsText || '()';
+          signature = returnType ? `${head} -> ${returnType}` : head;
+        } else {
+          signature = paramsText || undefined;
+        }
         // Resolve visibility:
         //   in module          → module's resolver (default + per-symbol)
         //   top-level (no scope) → `public` — external routines are globally callable
@@ -224,6 +328,7 @@ export const fortranExtractor: LanguageExtractor = {
         const created = ctx.createNode('function', name, node, { signature, visibility });
         if (created) {
           ctx.pushScope(created.id);
+          scopeKinds.push('function');
           // Emit a `parameter` node per declared argument, with the declared
           // type ("INTEGER", "REAL", "TYPE(FOO)", …) in `signature`. The type
           // comes from a `variable_declaration` in the routine's body, since
@@ -233,11 +338,12 @@ export const fortranExtractor: LanguageExtractor = {
             for (const p of params.namedChildren) {
               if (!p || p.type !== 'identifier') continue;
               const pname = norm(getNodeText(p, src));
-              const ptype = parameterType(node, pname, src);
+              const ptype = declaredTypeOf(node, pname, src);
               ctx.createNode('parameter', pname, p, { signature: ptype });
             }
           }
           visitBody(node, headerType, ctx);
+          scopeKinds.pop();
           ctx.popScope();
         }
         return true;
@@ -266,9 +372,15 @@ export const fortranExtractor: LanguageExtractor = {
             addRef(baseIdent, norm(getNodeText(baseIdent, src)), 'extends', ctx);
           }
         }
-        if (created) ctx.pushScope(created.id);
+        if (created) {
+          ctx.pushScope(created.id);
+          scopeKinds.push('struct');
+        }
         visitBody(node, 'derived_type_statement', ctx);
-        if (created) ctx.popScope();
+        if (created) {
+          scopeKinds.pop();
+          ctx.popScope();
+        }
         return true;
       }
 
@@ -281,9 +393,59 @@ export const fortranExtractor: LanguageExtractor = {
         const name = ifaceName || '<anonymous-interface>';
         const visibility = ifaceName ? currentModuleVisibility(ifaceName) : undefined;
         const created = ctx.createNode('interface', name, node, { visibility });
-        if (created) ctx.pushScope(created.id);
+        if (created) {
+          ctx.pushScope(created.id);
+          scopeKinds.push('interface');
+        }
         visitBody(node, 'interface_statement', ctx);
-        if (created) ctx.popScope();
+        if (created) {
+          scopeKinds.pop();
+          ctx.popScope();
+        }
+        return true;
+      }
+
+      case 'variable_declaration': {
+        // Only emit symbols when the declaration is the public/private surface
+        // of a module or the field list of a derived type. Inside a routine
+        // body these are local variables / parameter type specs and we don't
+        // surface them as graph nodes.
+        const scope = currentScopeKind();
+        if (scope !== 'module' && scope !== 'struct') return true;
+
+        const typeNode = node.namedChildren.find(
+          (n) => n?.type === 'intrinsic_type' || n?.type === 'derived_type',
+        );
+        const declaredType = typeNode ? norm(getNodeText(typeNode, src)) : undefined;
+        const qualifiers = typeQualifiers(node, src);
+        const isParameter = qualifiers.includes('parameter');
+        const inlineVisibility: 'public' | 'private' | undefined = qualifiers.includes('private')
+          ? 'private'
+          : qualifiers.includes('public')
+          ? 'public'
+          : undefined;
+
+        const kind: NodeKind =
+          scope === 'struct' ? 'field' : isParameter ? 'constant' : 'variable';
+
+        for (const entry of eachDeclaredEntry(node, src)) {
+          // For module-level decls visibility resolves through the module
+          // frame (inline qualifier wins, else the per-symbol/default
+          // resolver). For struct fields the default is public; an inline
+          // qualifier overrides.
+          const visibility =
+            inlineVisibility ??
+            (scope === 'module' ? currentModuleVisibility(entry.name) : 'public');
+          // Pack the value into the signature for PARAMETER constants — the
+          // value is part of what defines the constant.
+          const signature =
+            entry.value !== undefined && isParameter
+              ? declaredType
+                ? `${declaredType} = ${entry.value}`
+                : `= ${entry.value}`
+              : declaredType;
+          ctx.createNode(kind, entry.name, entry.node, { signature, visibility });
+        }
         return true;
       }
 

@@ -4462,6 +4462,129 @@ end subroutine
     });
   });
 
+  describe('Function return types', () => {
+    it('should encode return type in the function signature for prefix, RESULT, and implicit forms', () => {
+      const code = `
+integer function sum_two(a, b)
+   integer, intent(in) :: a, b
+   sum_two = a + b
+end function
+
+function get_pi() result(r)
+   real :: r
+   r = 3.14
+end function
+
+function magic()
+   integer :: magic
+   magic = 42
+end function
+
+subroutine no_return(x)
+   integer :: x
+end subroutine
+`;
+      const result = extractFromSource('rt.f90', code);
+      const fn = (n: string) =>
+        result.nodes.find((x) => x.kind === 'function' && x.name === n);
+      // Prefix type: signature ends with `-> INTEGER`.
+      expect(fn('SUM_TWO')?.signature).toMatch(/-> INTEGER$/);
+      // RESULT clause names a body-declared return variable.
+      expect(fn('GET_PI')?.signature).toMatch(/-> REAL$/);
+      // No prefix, no RESULT: the function's own name carries the return type.
+      expect(fn('MAGIC')?.signature).toMatch(/-> INTEGER$/);
+      // Subroutines have no return type — no arrow in the signature.
+      expect(fn('NO_RETURN')?.signature).not.toContain('->');
+    });
+  });
+
+  describe('Derived-type fields', () => {
+    it('should emit each derived-type member as a typed field node', () => {
+      const code = `
+module geom
+   type :: shape
+      integer :: id
+      real :: x, y
+      integer, private :: secret
+   end type
+end module
+`;
+      const result = extractFromSource('geom.f90', code);
+      const fields = result.nodes.filter(
+        (n) => n.kind === 'field' && n.qualifiedName.startsWith('GEOM::SHAPE::'),
+      );
+      expect(fields.map((f) => f.name).sort()).toEqual(['ID', 'SECRET', 'X', 'Y']);
+      const byName = Object.fromEntries(fields.map((f) => [f.name, f]));
+      expect(byName.ID.signature).toBe('INTEGER');
+      expect(byName.X.signature).toBe('REAL');
+      expect(byName.Y.signature).toBe('REAL');
+      // Inline `, PRIVATE` overrides the default public visibility for fields.
+      expect(byName.SECRET.visibility).toBe('private');
+      expect(byName.ID.visibility).toBe('public');
+    });
+  });
+
+  describe('Module-level constants and variables', () => {
+    it('should emit PARAMETER declarations as constants, plain declarations as variables, and resolve visibility', () => {
+      const code = `
+module config
+   integer, parameter, public :: PI_INT = 3, MAX = 100
+   real, parameter :: PI = 3.14
+   integer, public :: counter
+   integer, private :: secret_count
+   integer :: implicit_default
+end module
+
+module locked_down
+   private
+   integer, public :: exposed
+   integer :: hidden
+end module
+`;
+      const result = extractFromSource('config.f90', code);
+      const constants = result.nodes.filter((n) => n.kind === 'constant');
+      const variables = result.nodes.filter((n) => n.kind === 'variable');
+
+      // Three constants from two PARAMETER decls.
+      expect(constants.map((c) => c.name).sort()).toEqual(['MAX', 'PI', 'PI_INT']);
+      // Value is captured in the signature for the PARAMETER form.
+      const pi = constants.find((c) => c.name === 'PI');
+      expect(pi?.signature).toBe('REAL = 3.14');
+      const piInt = constants.find((c) => c.name === 'PI_INT');
+      expect(piInt?.signature).toBe('INTEGER = 3');
+      expect(piInt?.visibility).toBe('public');
+
+      // Module variables (non-PARAMETER).
+      const variableNames = variables.map((v) => v.name).sort();
+      expect(variableNames).toContain('COUNTER');
+      expect(variableNames).toContain('SECRET_COUNT');
+      expect(variableNames).toContain('IMPLICIT_DEFAULT');
+      expect(variableNames).toContain('EXPOSED');
+      expect(variableNames).toContain('HIDDEN');
+
+      const byName = Object.fromEntries(variables.map((v) => [v.name, v]));
+      expect(byName.COUNTER.visibility).toBe('public');           // inline PUBLIC
+      expect(byName.SECRET_COUNT.visibility).toBe('private');     // inline PRIVATE
+      expect(byName.IMPLICIT_DEFAULT.visibility).toBe('public');  // module default
+      // Module-default PRIVATE flips the implicit visibility.
+      expect(byName.EXPOSED.visibility).toBe('public');           // inline PUBLIC wins
+      expect(byName.HIDDEN.visibility).toBe('private');           // bare PRIVATE default
+    });
+
+    it('should not emit local variables inside routines as module-level symbols', () => {
+      const code = `
+module m
+contains
+   subroutine helper()
+      integer :: local_only
+   end subroutine
+end module
+`;
+      const result = extractFromSource('m.f90', code);
+      expect(result.nodes.find((n) => n.name === 'LOCAL_ONLY')).toBeUndefined();
+    });
+  });
+
   describe('Visibility', () => {
     it('should resolve subroutine/function visibility from module access statements', () => {
       const code = `
