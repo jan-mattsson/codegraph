@@ -37,6 +37,54 @@ function visitBody(node: SyntaxNode, headerType: string, ctx: ExtractorContext):
   }
 }
 
+// -----------------------------------------------------------------------------
+// Module visibility resolution
+// -----------------------------------------------------------------------------
+//
+// Fortran modules default to PUBLIC. A bare `PRIVATE` statement flips the
+// default; `PUBLIC :: a, b` and `PRIVATE :: c, d` override per-symbol. A
+// derived type can also carry an inline `access_specifier` (`TYPE, PUBLIC ::
+// FOO`) which trumps the module default.
+//
+// Subroutine and function visibility is NEVER declared inline on the
+// `subroutine_statement` — it always has to be resolved from the enclosing
+// module's access statements. So we do a one-shot pass over the module body
+// when we enter it, build a {default + per-symbol overrides} frame, push it
+// on a stack, and let symbol emission look it up by name. The stack handles
+// nested forms (interface blocks have their own visibility scope in
+// principle); it is cleared on every `translation_unit` so state never
+// leaks between files.
+
+type ModuleFrame = {
+  defaultVisibility: 'public' | 'private';
+  perSymbol: Map<string, 'public' | 'private'>;
+};
+const moduleFrames: ModuleFrame[] = [];
+
+function currentModuleVisibility(name: string): 'public' | 'private' | undefined {
+  const frame = moduleFrames[moduleFrames.length - 1];
+  if (!frame) return undefined;
+  return frame.perSymbol.get(name) ?? frame.defaultVisibility;
+}
+
+function buildModuleFrame(moduleNode: SyntaxNode, src: string): ModuleFrame {
+  const frame: ModuleFrame = { defaultVisibility: 'public', perSymbol: new Map() };
+  for (const c of moduleNode.namedChildren) {
+    if (!c) continue;
+    if (c.type !== 'private_statement' && c.type !== 'public_statement') continue;
+    const access: 'public' | 'private' = c.type === 'private_statement' ? 'private' : 'public';
+    const idents = c.namedChildren.filter((n) => n?.type === 'identifier');
+    if (idents.length === 0) {
+      frame.defaultVisibility = access;
+    } else {
+      for (const id of idents) {
+        if (id) frame.perSymbol.set(norm(getNodeText(id, src)), access);
+      }
+    }
+  }
+  return frame;
+}
+
 // Names declared on the LHS of a `variable_declaration`. Direct `identifier`
 // children are simple names (`INTEGER :: A, B`); `sized_declarator` and
 // `init_declarator` wrap a name plus a size/initialiser (`INTEGER :: A(N)`),
@@ -120,15 +168,28 @@ export const fortranExtractor: LanguageExtractor = {
     const src = ctx.source;
 
     switch (node.type) {
+      case 'translation_unit': {
+        // Clear the visibility stack at every file boundary so a crash mid-
+        // walk on a previous file can't leak state into the next one.
+        moduleFrames.length = 0;
+        return false; // let the default walker descend into children
+      }
+
       case 'module':
       case 'submodule': {
         const headerType = node.type === 'module' ? 'module_statement' : 'submodule_statement';
         const stmt = findChild(node, headerType);
         const name = statementName(stmt, src);
         const created = ctx.createNode('module', name || '<anonymous>', node);
+        // Only top-level modules carry access statements; submodules inherit
+        // visibility from the parent module's interface section, which we
+        // don't try to resolve here.
+        const frame = node.type === 'module' ? buildModuleFrame(node, src) : null;
+        if (frame) moduleFrames.push(frame);
         if (created) ctx.pushScope(created.id);
         visitBody(node, headerType, ctx);
         if (created) ctx.popScope();
+        if (frame) moduleFrames.pop();
         return true;
       }
 
@@ -150,7 +211,17 @@ export const fortranExtractor: LanguageExtractor = {
         if (!name) return true; // malformed — skip but don't recurse
         const params = stmt ? stmt.childForFieldName('parameters') : null;
         const signature = params ? getNodeText(params, src) : undefined;
-        const created = ctx.createNode('function', name, node, { signature });
+        // Resolve visibility:
+        //   in module          → module's resolver (default + per-symbol)
+        //   top-level (no scope) → `public` — external routines are globally callable
+        //   nested in program / parent routine's CONTAINS → `private` to the enclosing unit
+        // The file scope is always at the bottom of nodeStack, so length === 1
+        // means "no Fortran scope above me".
+        let visibility = currentModuleVisibility(name);
+        if (visibility === undefined) {
+          visibility = ctx.nodeStack.length <= 1 ? 'public' : 'private';
+        }
+        const created = ctx.createNode('function', name, node, { signature, visibility });
         if (created) {
           ctx.pushScope(created.id);
           // Emit a `parameter` node per declared argument, with the declared
@@ -175,7 +246,18 @@ export const fortranExtractor: LanguageExtractor = {
       case 'derived_type_definition': {
         const stmt = findChild(node, 'derived_type_statement');
         const name = statementName(stmt, src);
-        const created = ctx.createNode('struct', name || '<anonymous>', node);
+        // Inline `access_specifier` on `TYPE, PUBLIC :: …` wins; otherwise
+        // fall back to the enclosing module's resolved visibility for `name`.
+        let visibility: 'public' | 'private' | undefined;
+        if (stmt) {
+          const accessSpec = findChild(stmt, 'access_specifier');
+          if (accessSpec) {
+            const text = getNodeText(accessSpec, src).trim().toLowerCase();
+            if (text === 'public' || text === 'private') visibility = text;
+          }
+        }
+        if (!visibility) visibility = currentModuleVisibility(name);
+        const created = ctx.createNode('struct', name || '<anonymous>', node, { visibility });
         // Capture `EXTENDS(Parent)` as an `extends` reference.
         if (created && stmt) {
           const base = stmt.childForFieldName('base');
@@ -195,8 +277,10 @@ export const fortranExtractor: LanguageExtractor = {
         // Generic interfaces have a name (`INTERFACE SOLVE`); abstract /
         // explicit-interface blocks are anonymous — index them as a container
         // anyway so the procedures inside still belong to *something*.
-        const name = statementName(stmt, src) || '<anonymous-interface>';
-        const created = ctx.createNode('interface', name, node);
+        const ifaceName = statementName(stmt, src);
+        const name = ifaceName || '<anonymous-interface>';
+        const visibility = ifaceName ? currentModuleVisibility(ifaceName) : undefined;
+        const created = ctx.createNode('interface', name, node, { visibility });
         if (created) ctx.pushScope(created.id);
         visitBody(node, 'interface_statement', ctx);
         if (created) ctx.popScope();

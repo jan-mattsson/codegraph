@@ -4462,6 +4462,82 @@ end subroutine
     });
   });
 
+  describe('Visibility', () => {
+    it('should resolve subroutine/function visibility from module access statements', () => {
+      const code = `
+module mod_a
+   private
+   public :: api_a
+contains
+   subroutine api_a()
+   end subroutine
+   subroutine helper_a()
+   end subroutine
+end module
+
+module mod_b
+   private :: helper_b
+contains
+   subroutine api_b()
+   end subroutine
+   subroutine helper_b()
+   end subroutine
+end module
+`;
+      const result = extractFromSource('vis.f90', code);
+      const fn = (n: string) =>
+        result.nodes.find((x) => x.kind === 'function' && x.name === n);
+      // mod_a: bare PRIVATE default + selective PUBLIC override
+      expect(fn('API_A')?.visibility).toBe('public');
+      expect(fn('HELPER_A')?.visibility).toBe('private');
+      // mod_b: implicit PUBLIC default + selective PRIVATE override
+      expect(fn('API_B')?.visibility).toBe('public');
+      expect(fn('HELPER_B')?.visibility).toBe('private');
+    });
+
+    it('should use inline access_specifier on a derived type when present, else fall back to the module default', () => {
+      const code = `
+module shapes
+   private
+   type, public :: shape
+      integer :: x
+   end type
+   type :: secret
+      integer :: y
+   end type
+end module
+`;
+      const result = extractFromSource('shapes.f90', code);
+      const struct = (n: string) =>
+        result.nodes.find((x) => x.kind === 'struct' && x.name === n);
+      expect(struct('SHAPE')?.visibility).toBe('public');
+      expect(struct('SECRET')?.visibility).toBe('private');
+    });
+
+    it('should mark a top-level external routine as public and a contained internal routine as private', () => {
+      // A subroutine sitting directly at the file root is an external routine,
+      // globally callable from any program unit that declares it — effectively
+      // public. A subroutine inside a program's (or another routine's)
+      // CONTAINS section is only visible to its enclosing unit, so it's
+      // effectively private.
+      const code = `
+subroutine standalone()
+end subroutine
+
+program driver
+contains
+   subroutine inner()
+   end subroutine
+end program
+`;
+      const result = extractFromSource('s.f90', code);
+      const fn = (n: string) =>
+        result.nodes.find((x) => x.kind === 'function' && x.name === n);
+      expect(fn('STANDALONE')?.visibility).toBe('public');
+      expect(fn('INNER')?.visibility).toBe('private');
+    });
+  });
+
   describe('Call extraction', () => {
     it('should record CALL statements and function calls as calls references', () => {
       const code = `
