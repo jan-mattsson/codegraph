@@ -597,6 +597,14 @@ export const fortranExtractor: LanguageExtractor = {
         // the edge to the right file. We deliberately don't case-fold this:
         // file node names preserve filesystem casing, and Fortran convention
         // is to write the include path as it appears on disk.
+        //
+        // Limitation: when two files in the tree share a basename (e.g.
+        // `subsys-a/utils.fi` and `subsys-b/utils.fi`), the resolver picks
+        // the path-proximate candidate, not the one the compiler's `-I`
+        // search order would actually find. A robust fix would route through
+        // resolveImportPath() and an -I-aware lookup, the way the C/C++
+        // pipeline does for `compile_commands.json`. Left as a follow-up —
+        // costs nothing when basenames are unique (the common case).
         let raw: string | undefined;
         if (node.type === 'preproc_include') {
           // #include "foo.fi" — string_literal child wraps the path. Tree-
